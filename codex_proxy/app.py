@@ -8,6 +8,7 @@ unlikely path so it never shadows a real upstream endpoint.
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 
 import httpx
@@ -17,6 +18,21 @@ from starlette.routing import Route
 
 from .config import Config
 from .proxy import RetryProxy
+
+
+def _configure_debug_logging(cfg: Config) -> None:
+    """Send codex_proxy diagnostic logs to a file (or stderr) at DEBUG level."""
+    log = logging.getLogger("codex_proxy")
+    log.setLevel(logging.DEBUG)
+    log.handlers.clear()
+    handler: logging.Handler
+    if cfg.debug_log:
+        handler = logging.FileHandler(cfg.debug_log)
+    else:
+        handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    log.addHandler(handler)
+    log.propagate = False
 
 _PROXIED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
 
@@ -36,6 +52,8 @@ def create_app(
     cfg: Config | None = None, client: httpx.AsyncClient | None = None
 ) -> Starlette:
     cfg = cfg or Config.from_env()
+    if cfg.debug:
+        _configure_debug_logging(cfg)
     owns_client = client is None
     client = client or build_client(cfg)
     proxy = RetryProxy(cfg, client)

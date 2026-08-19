@@ -79,8 +79,17 @@ async def _sse_capacity_failure():
     )
 
 
-def make_upstream(mode: str, fail_times: int, success_text: str = "Hello"):
-    """Fake upstream that fails ``fail_times`` times, then succeeds. Counts calls."""
+def make_upstream(
+    mode: str,
+    fail_times: int,
+    success_text: str = "Hello",
+    sse_media_type: str = "text/event-stream",
+):
+    """Fake upstream that fails ``fail_times`` times, then succeeds. Counts calls.
+
+    ``sse_media_type`` lets a test mimic a gateway that streams SSE under a
+    non-standard content-type such as ``text/plain``.
+    """
     state = {"calls": 0}
 
     async def handler(request):
@@ -93,15 +102,11 @@ def make_upstream(mode: str, fail_times: int, success_text: str = "Hello"):
                     status_code=503,
                     media_type="application/json",
                 )
-            return StreamingResponse(
-                _sse_success(success_text), media_type="text/event-stream"
-            )
+            return StreamingResponse(_sse_success(success_text), media_type=sse_media_type)
         # mode == "sse"
         if failing:
-            return StreamingResponse(
-                _sse_capacity_failure(), media_type="text/event-stream"
-            )
-        return StreamingResponse(_sse_success(success_text), media_type="text/event-stream")
+            return StreamingResponse(_sse_capacity_failure(), media_type=sse_media_type)
+        return StreamingResponse(_sse_success(success_text), media_type=sse_media_type)
 
     app = Starlette(
         routes=[Route("/{path:path}", handler, methods=["GET", "POST"])]
@@ -218,6 +223,53 @@ async def test_proxy_injects_api_key_overriding_downstream():
 
     # Codex sent "codex-token"; upstream must see the proxy's key instead.
     assert seen["auth"] == "Bearer sk-upstream-secret"
+
+
+async def test_capacity_hidden_when_sse_served_as_text_plain():
+    # Regression for the real gateway: it streams SSE with content-type
+    # text/plain, so the capacity failure event must still be caught & retried
+    # rather than leaking through as a plain 2xx body.
+    upstream_app, state = make_upstream(
+        "sse", fail_times=2, success_text="pong", sse_media_type="text/plain"
+    )
+    async with RunningServer(upstream_app) as up:
+        proxy_app = create_app(fast_cfg(up.base))
+        async with RunningServer(proxy_app) as px:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(f"{px.base}/v1/responses", json={})
+
+    assert r.status_code == 200
+    assert "pong" in r.text
+    assert "capacity" not in r.text.lower()  # the leak is fixed
+    assert state["calls"] == 3  # 2 capacity failures + 1 success
+
+
+async def test_capacity_in_200_json_body_is_retried():
+    # Some gateways answer 200 with an error JSON body (not SSE). It must be
+    # inspected and retried, not forwarded as success.
+    state = {"calls": 0}
+
+    async def handler(request):
+        state["calls"] += 1
+        if state["calls"] <= 2:
+            return Response(
+                content=f'{{"error":{{"message":"{CAPACITY}"}}}}'.encode(),
+                status_code=200,
+                media_type="application/json",
+            )
+        return Response(content=b'{"ok":true}', status_code=200, media_type="application/json")
+
+    app = Starlette(routes=[Route("/{path:path}", handler, methods=["POST"])])
+    async with RunningServer(app) as up:
+        proxy_app = create_app(fast_cfg(up.base))
+        async with RunningServer(proxy_app) as px:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(f"{px.base}/v1/responses", json={})
+
+    assert r.status_code == 200
+    assert "capacity" not in r.text.lower()
+    assert '"ok":true' in r.text
+    assert state["calls"] == 3
 
 
 async def test_health_endpoint():

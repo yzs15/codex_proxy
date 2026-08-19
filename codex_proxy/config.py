@@ -21,6 +21,13 @@ def _env_opt(name: str) -> str | None:
     return value if value not in (None, "") else None
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(f"CODEX_PROXY_{name}")
+    if raw in (None, ""):
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(f"CODEX_PROXY_{name}")
     return float(raw) if raw not in (None, "") else default
@@ -131,6 +138,17 @@ class Config:
     # a decision, force a commit + passthrough rather than buffering unbounded.
     max_prelude_bytes: int = field(
         default_factory=lambda: int(_env("MAX_PRELUDE_BYTES", "65536"))
+    )
+
+    # --- diagnostics ---
+    # When on, logs every upstream attempt's status/body/SSE events, each retry
+    # decision, and warns if a capacity signal leaks downstream. Off by default.
+    debug: bool = field(default_factory=lambda: _env_bool("DEBUG", False))
+    # File to write diagnostic logs to; when unset, they go to stderr.
+    debug_log: str | None = field(default_factory=lambda: _env_opt("DEBUG_LOG"))
+    # Max bytes of any body/event payload written to the diagnostic log.
+    debug_body_limit: int = field(
+        default_factory=lambda: int(_env("DEBUG_BODY_LIMIT", "4000"))
     )
 
     # --- httpx timeouts ---

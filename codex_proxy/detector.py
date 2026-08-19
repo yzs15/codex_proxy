@@ -28,6 +28,15 @@ def _matches_message(text: str, cfg: Config) -> bool:
     return any(sub.lower() in lowered for sub in cfg.retry_message_substrings)
 
 
+def contains_retry_signal(text: str, cfg: Config) -> bool:
+    """Public: does this text carry a known capacity/overload signal?
+
+    Used for diagnostics — e.g. detecting a capacity message that leaked into a
+    2xx body or a post-commit stream.
+    """
+    return _matches_message(text, cfg)
+
+
 def is_retryable_http(status: int, body: bytes, cfg: Config) -> bool:
     """True if a non-streaming HTTP response should be retried.
 

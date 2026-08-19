@@ -16,6 +16,8 @@ byte-for-byte passthrough.
 from __future__ import annotations
 
 import asyncio
+import itertools
+import logging
 
 import httpx
 from starlette.requests import Request
@@ -23,12 +25,26 @@ from starlette.responses import Response, StreamingResponse
 
 from .backoff import Backoff
 from .config import Config
-from .detector import EventClass, classify_sse_event, is_retryable_http
+from .detector import (
+    EventClass,
+    classify_sse_event,
+    contains_retry_signal,
+    is_retryable_http,
+)
 from .sse import SSEDecoder
+
+logger = logging.getLogger("codex_proxy")
 
 
 class RetrySignal(Exception):
-    """Internal: the current attempt failed transiently; back off and retry."""
+    """Internal: the current attempt failed transiently; back off and retry.
+
+    ``reason`` is a human-readable explanation used only for diagnostic logging.
+    """
+
+    def __init__(self, reason: str = "") -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 class ClientGone(Exception):
@@ -53,12 +69,32 @@ _REQUEST_DROP = _HOP_BY_HOP | {"host", "content-length", "accept-encoding"}
 # Starlette owns it (avoids a duplicated header).
 _RESPONSE_DROP = _HOP_BY_HOP | {"content-length", "content-encoding", "content-type"}
 
+# SSE field prefixes. Used to sniff a stream as Server-Sent-Events by content,
+# because some upstreams (e.g. the ChatGPT/Codex gateways) serve SSE with
+# content-type: text/plain instead of text/event-stream.
+_SSE_LINE_PREFIXES = (b"event:", b"data:", b"id:", b"retry:", b":")
+
+
+def _looks_like_sse(data: bytes) -> bool:
+    """Heuristic: does this response body start with SSE framing?"""
+    head = data.lstrip()[:64].lower()
+    return head.startswith(_SSE_LINE_PREFIXES)
+
 
 class RetryProxy:
     def __init__(self, cfg: Config, client: httpx.AsyncClient) -> None:
         self.cfg = cfg
         self.client = client
         self.backoff = Backoff.from_config(cfg)
+        self._rid = itertools.count(1)
+
+    # ------------------------------------------------------------- diagnostics
+
+    def _snippet(self, data: bytes | str) -> str:
+        if isinstance(data, bytes):
+            data = data.decode("utf-8", errors="replace")
+        limit = self.cfg.debug_body_limit
+        return data[:limit] + ("…(truncated)" if len(data) > limit else "")
 
     # ------------------------------------------------------------------ public
 
@@ -67,19 +103,29 @@ class RetryProxy:
         method = request.method
         url = self._build_url(request)
         headers = self._request_headers(request)
+        rid = next(self._rid)
+        debug = self.cfg.debug
+
+        if debug:
+            logger.info("[%d] %s %s (request body %dB)", rid, method, url, len(body))
 
         attempt = 0
         while True:
             attempt += 1
             if await request.is_disconnected():
+                if debug:
+                    logger.info("[%d] client disconnected before attempt %d", rid, attempt)
                 return Response(status_code=499)
             try:
-                return await self._attempt(method, url, headers, body, attempt)
-            except RetrySignal:
-                pass
+                return await self._attempt(method, url, headers, body, attempt, rid)
+            except RetrySignal as sig:
+                if debug:
+                    logger.info("[%d] attempt %d -> RETRY (%s)", rid, attempt, sig.reason)
             except httpx.RequestError as exc:
                 # Connect refused / reset / timeout before a response arrived:
                 # treat as transient and retry (subject to max_retries).
+                if debug:
+                    logger.warning("[%d] attempt %d transport error: %r", rid, attempt, exc)
                 if not self._should_retry(attempt):
                     return Response(
                         content=f"upstream request failed: {exc!r}".encode(),
@@ -87,8 +133,10 @@ class RetryProxy:
                         media_type="text/plain; charset=utf-8",
                     )
             try:
-                await self._sleep_backoff(attempt, request)
+                await self._sleep_backoff(attempt, request, rid)
             except ClientGone:
+                if debug:
+                    logger.info("[%d] client disconnected during backoff", rid)
                 return Response(status_code=499)
 
     # --------------------------------------------------------------- one attempt
@@ -100,18 +148,29 @@ class RetryProxy:
         headers: dict[str, str],
         body: bytes,
         attempt: int,
+        rid: int,
     ) -> Response:
+        debug = self.cfg.debug
         req = self.client.build_request(method, url, headers=headers, content=body)
         resp = await self.client.send(req, stream=True)
         status = resp.status_code
         content_type = resp.headers.get("content-type", "")
         resp_headers = self._response_headers(resp)
 
+        if debug:
+            logger.info(
+                "[%d] attempt %d <- status=%d content-type=%r", rid, attempt, status, content_type
+            )
+
         if not 200 <= status < 300:
             raw = await resp.aread()
             await self._safe_close(resp)
+            if debug:
+                logger.info("[%d] attempt %d non-2xx body: %s", rid, attempt, self._snippet(raw))
             if is_retryable_http(status, raw, self.cfg) and self._should_retry(attempt):
-                raise RetrySignal()
+                raise RetrySignal(f"http {status} matched retryable signature")
+            if debug:
+                logger.info("[%d] forwarding non-retryable status %d downstream", rid, status)
             return Response(
                 content=raw,
                 status_code=status,
@@ -119,12 +178,57 @@ class RetryProxy:
                 media_type=content_type or None,
             )
 
-        if "text/event-stream" in content_type.lower():
-            return await self._gate_stream(resp, attempt, resp_headers, content_type)
+        # 2xx: decide whether the body is SSE by content, NOT just by
+        # content-type — some gateways stream SSE as text/plain. Peek the first
+        # chunk to sniff, then either gate it as a stream or buffer & forward.
+        aiter = resp.aiter_bytes()
+        try:
+            initial = await anext(aiter)
+        except StopAsyncIteration:
+            initial = b""
+        except httpx.RequestError:
+            await self._safe_close(resp)
+            if self._should_retry(attempt):
+                raise RetrySignal("transport error before first response chunk")
+            raise
 
-        # Non-streaming 2xx: buffer fully and forward.
-        raw = await resp.aread()
+        is_sse = "text/event-stream" in content_type.lower() or _looks_like_sse(initial)
+        if debug:
+            logger.info(
+                "[%d] attempt %d 2xx sniff: is_sse=%s (content-type=%r head=%r)",
+                rid, attempt, is_sse, content_type, initial[:32],
+            )
+        if is_sse:
+            return await self._gate_stream(
+                resp, attempt, resp_headers, content_type, rid, aiter, initial
+            )
+
+        # Genuinely non-SSE 2xx: buffer fully and forward. Still inspect the body
+        # for a capacity signal — covers a gateway that answers 200 + error JSON.
+        rest = bytearray(initial)
+        try:
+            async for chunk in aiter:
+                rest += chunk
+        except httpx.RequestError:
+            await self._safe_close(resp)
+            if self._should_retry(attempt):
+                raise RetrySignal("transport error reading 2xx body")
+            raise
         await self._safe_close(resp)
+        raw = bytes(rest)
+        if contains_retry_signal(raw.decode("utf-8", errors="replace"), self.cfg) and (
+            self._should_retry(attempt)
+        ):
+            if debug:
+                logger.info(
+                    "[%d] attempt %d 2xx non-SSE body matched capacity signal -> retry: %s",
+                    rid, attempt, self._snippet(raw),
+                )
+            raise RetrySignal("2xx non-SSE body matched capacity signal")
+        if debug:
+            logger.info(
+                "[%d] attempt %d 2xx non-SSE body (%dB) forwarded", rid, attempt, len(raw)
+            )
         return Response(
             content=raw,
             status_code=status,
@@ -138,44 +242,76 @@ class RetryProxy:
         attempt: int,
         resp_headers: dict[str, str],
         content_type: str,
+        rid: int,
+        aiter,
+        initial: bytes = b"",
     ) -> Response:
-        """Buffer the SSE stream until it either retries or commits to content."""
+        """Buffer the SSE stream until it either retries or commits to content.
+
+        ``aiter`` is the upstream byte iterator (the caller created it so it could
+        peek the first chunk); ``initial`` is that already-pulled first chunk.
+        """
+        debug = self.cfg.debug
         decoder = SSEDecoder()
-        aiter = resp.aiter_bytes()
         to_flush = bytearray()  # buffered pre-commit events, flushed on commit
         remainder = bytearray()  # already-parsed bytes after the commit point
         committed = False
 
-        try:
-            async for chunk in aiter:
-                events = decoder.feed(chunk)
-                for i, ev in enumerate(events):
-                    cls = classify_sse_event(ev, self.cfg)
-                    if cls is EventClass.RETRY and self._should_retry(attempt):
-                        await self._safe_close(resp)
-                        raise RetrySignal()
-                    # RETRY-but-exhausted, or COMMIT, both commit and forward.
-                    to_flush += ev.raw
-                    if cls is not EventClass.LIFECYCLE:
-                        committed = True
-                        for later in events[i + 1 :]:
-                            remainder += later.raw
-                        remainder += decoder.leftover
-                        break
-                if committed:
-                    break
-                if len(to_flush) > self.cfg.max_prelude_bytes:
-                    # Safety valve: forward what we have instead of buffering forever.
-                    remainder += decoder.leftover
+        async def consume(chunk: bytes) -> bool:
+            """Feed one chunk through the gate; return True once it commits."""
+            nonlocal committed
+            events = decoder.feed(chunk)
+            for i, ev in enumerate(events):
+                cls = classify_sse_event(ev, self.cfg)
+                if debug:
+                    logger.info(
+                        "[%d] attempt %d sse event type=%r class=%s data=%s",
+                        rid, attempt, ev.event, cls.name, self._snippet(ev.data),
+                    )
+                if cls is EventClass.RETRY and self._should_retry(attempt):
+                    await self._safe_close(resp)
+                    raise RetrySignal(
+                        f"sse event type={ev.event!r} matched capacity signal"
+                    )
+                # RETRY-but-exhausted, or COMMIT, both commit and forward.
+                to_flush.extend(ev.raw)
+                if cls is not EventClass.LIFECYCLE:
                     committed = True
-                    break
+                    if debug:
+                        logger.info(
+                            "[%d] attempt %d committed at event type=%r (streaming passthrough)",
+                            rid, attempt, ev.event,
+                        )
+                    for later in events[i + 1 :]:
+                        remainder.extend(later.raw)
+                    remainder.extend(decoder.leftover)
+                    return True
+            return False
+
+        try:
+            if initial:
+                await consume(initial)
+            if not committed:
+                async for chunk in aiter:
+                    if await consume(chunk):
+                        break
+                    if len(to_flush) > self.cfg.max_prelude_bytes:
+                        # Safety valve: forward instead of buffering forever.
+                        if debug:
+                            logger.warning(
+                                "[%d] attempt %d prelude exceeded %dB without commit — "
+                                "forcing passthrough", rid, attempt, self.cfg.max_prelude_bytes,
+                            )
+                        remainder.extend(decoder.leftover)
+                        committed = True
+                        break
         except RetrySignal:
             raise
-        except httpx.RequestError:
+        except httpx.RequestError as exc:
             # Connection died before we committed anything downstream -> retry.
             await self._safe_close(resp)
             if self._should_retry(attempt):
-                raise RetrySignal()
+                raise RetrySignal(f"stream transport error before commit: {exc!r}")
             raise
 
         if not committed:
@@ -183,6 +319,17 @@ class RetryProxy:
             # retryable, so forward verbatim rather than loop forever.
             final = bytes(to_flush) + decoder.leftover
             await self._safe_close(resp)
+            if debug:
+                leaked = contains_retry_signal(
+                    final.decode("utf-8", errors="replace"), self.cfg
+                )
+                logger.log(
+                    logging.WARNING if leaked else logging.INFO,
+                    "[%d] attempt %d SSE ended without commit%s: %s",
+                    rid, attempt,
+                    " — CONTAINS CAPACITY SIGNAL (LEAKED)" if leaked else "",
+                    self._snippet(final),
+                )
             return Response(
                 content=final,
                 status_code=resp.status_code,
@@ -191,12 +338,22 @@ class RetryProxy:
             )
 
         async def body_gen():
+            leak_logged = False
             try:
                 if to_flush:
                     yield bytes(to_flush)
                 if remainder:
                     yield bytes(remainder)
                 async for chunk in aiter:
+                    if debug and not leak_logged and contains_retry_signal(
+                        chunk.decode("utf-8", errors="replace"), self.cfg
+                    ):
+                        logger.warning(
+                            "[%d] CAPACITY SIGNAL in POST-COMMIT stream — LEAKED to client "
+                            "(arrived after content started; cannot retry safely): %s",
+                            rid, self._snippet(chunk),
+                        )
+                        leak_logged = True
                     yield chunk
             finally:
                 await self._safe_close(resp)
@@ -213,8 +370,10 @@ class RetryProxy:
     def _should_retry(self, attempt: int) -> bool:
         return self.cfg.max_retries is None or attempt < self.cfg.max_retries
 
-    async def _sleep_backoff(self, attempt: int, request: Request) -> None:
+    async def _sleep_backoff(self, attempt: int, request: Request, rid: int = 0) -> None:
         remaining = self.backoff.delay(attempt)
+        if self.cfg.debug:
+            logger.info("[%d] backing off %.2fs before attempt %d", rid, remaining, attempt + 1)
         slice_seconds = 0.5
         while remaining > 0:
             if await request.is_disconnected():
