@@ -46,6 +46,14 @@ export CODEX_PROXY_API_KEY="sk-..."   # optional: let the proxy hold the key
 python -m codex_proxy        # listens on 127.0.0.1:8787 by default
 ```
 
+Or just use the launcher (sources `~/.bashrc` for config, activates the venv,
+refuses to double-start on the same port):
+
+```bash
+./run.sh          # foreground (Ctrl-C to stop)
+./run.sh &        # background
+```
+
 Then point Codex at the proxy — set its base URL to `http://127.0.0.1:8787`.
 The proxy is fully path-transparent: whatever endpoint Codex hits is forwarded
 under `CODEX_PROXY_UPSTREAM_BASE_URL`, with all headers preserved.
