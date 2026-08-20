@@ -8,6 +8,7 @@ backend Codex actually talks to.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 
@@ -90,6 +91,67 @@ DEFAULT_LIFECYCLE_EVENTS = {
 }
 
 
+@dataclass(frozen=True)
+class Route:
+    """An upstream target: where to forward, and the credential to use."""
+
+    base_url: str
+    api_key: str | None = None
+
+
+def _load_routes(path: str) -> tuple[dict[str, Route], Route | None]:
+    """Parse a routes file into ``(model -> Route, default Route or None)``.
+
+    The file names upstreams (each ``base_url`` + optional ``api_key``) and maps
+    models to them, so a shared upstream's key is written once. Validation is
+    strict and fails loudly — a misconfigured proxy should not start silently.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        raise ValueError(f"routes file not found: {path}")
+    except OSError as exc:
+        raise ValueError(f"could not read routes file {path}: {exc}")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"routes file {path} is not valid JSON: {exc}")
+
+    if not isinstance(data, dict):
+        raise ValueError("routes file must be a JSON object")
+
+    raw_upstreams = data.get("upstreams") or {}
+    if not isinstance(raw_upstreams, dict):
+        raise ValueError("'upstreams' must be an object")
+    upstreams: dict[str, Route] = {}
+    for name, spec in raw_upstreams.items():
+        if not isinstance(spec, dict) or not isinstance(spec.get("base_url"), str):
+            raise ValueError(f"upstream {name!r} must have a string 'base_url'")
+        api_key = spec.get("api_key")
+        if api_key is not None and not isinstance(api_key, str):
+            raise ValueError(f"upstream {name!r} 'api_key' must be a string")
+        upstreams[name] = Route(base_url=spec["base_url"], api_key=api_key)
+
+    raw_models = data.get("models") or {}
+    if not isinstance(raw_models, dict):
+        raise ValueError("'models' must be an object")
+    model_routes: dict[str, Route] = {}
+    for model, upstream_name in raw_models.items():
+        if upstream_name not in upstreams:
+            raise ValueError(
+                f"model {model!r} references unknown upstream {upstream_name!r}"
+            )
+        model_routes[model] = upstreams[upstream_name]
+
+    default_route: Route | None = None
+    default_name = data.get("default")
+    if default_name is not None:
+        if default_name not in upstreams:
+            raise ValueError(f"'default' references unknown upstream {default_name!r}")
+        default_route = upstreams[default_name]
+
+    return model_routes, default_route
+
+
 @dataclass
 class Config:
     # --- networking ---
@@ -111,6 +173,15 @@ class Config:
     # log line + an ``X-Codex-Proxy-Warning`` response header) and never in the
     # response body. Leave unset to forward the requested model unchanged.
     model: str | None = field(default_factory=lambda: _env_opt("MODEL"))
+
+    # Optional per-model upstream routing. When ``routes_file`` is set, its JSON
+    # maps each model to a named upstream (base_url + optional api_key), with an
+    # optional ``default`` for unmatched models. Resolved at load time into
+    # ``model_routes`` and ``default_route``; a model with no route (and no
+    # default) falls back to ``upstream_base_url`` / ``api_key`` above.
+    routes_file: str | None = field(default_factory=lambda: _env_opt("ROUTES_FILE"))
+    model_routes: dict[str, Route] = field(default_factory=dict)
+    default_route: Route | None = None
 
     # --- retry policy ---
     # ``None`` means retry forever (the default behaviour requested for capacity
@@ -173,6 +244,10 @@ class Config:
     pool_timeout: float = field(
         default_factory=lambda: _env_float("POOL_TIMEOUT", 10.0)
     )
+
+    def __post_init__(self) -> None:
+        if self.routes_file:
+            self.model_routes, self.default_route = _load_routes(self.routes_file)
 
     @classmethod
     def from_env(cls) -> "Config":

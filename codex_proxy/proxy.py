@@ -75,6 +75,10 @@ _RESPONSE_DROP = _HOP_BY_HOP | {"content-length", "content-encoding", "content-t
 # content-type: text/plain instead of text/event-stream.
 _SSE_LINE_PREFIXES = (b"event:", b"data:", b"id:", b"retry:", b":")
 
+# Sentinel so _request_headers can tell "use the configured key" apart from an
+# explicitly-passed ``None`` (which means "inject no key, pass client auth through").
+_USE_CFG_KEY = object()
+
 
 def _looks_like_sse(data: bytes) -> bool:
     """Heuristic: does this response body start with SSE framing?"""
@@ -115,8 +119,6 @@ class RetryProxy:
     async def handle(self, request: Request) -> Response:
         body = await request.body()
         method = request.method
-        url = self._build_url(request)
-        headers = self._request_headers(request)
         rid = next(self._rid)
         debug = self.cfg.debug
 
@@ -136,6 +138,11 @@ class RetryProxy:
             if warning:
                 resp.headers["X-Codex-Proxy-Warning"] = warning
             return resp
+
+        # Route on the (possibly overridden) model: pick the upstream + credential.
+        base_url, api_key = self._resolve_route(self._effective_model(body))
+        url = self._build_url(request, base_url)
+        headers = self._request_headers(request, api_key)
 
         if debug:
             logger.info("[%d] %s %s (request body %dB)", rid, method, url, len(body))
@@ -449,22 +456,53 @@ class RetryProxy:
             await asyncio.sleep(nap)
             remaining -= nap
 
-    def _build_url(self, request: Request) -> str:
-        url = self.cfg.upstream_base_url.rstrip("/") + request.url.path
+    def _build_url(self, request: Request, base_url: str | None = None) -> str:
+        base = (base_url or self.cfg.upstream_base_url).rstrip("/")
+        url = base + request.url.path
         if request.url.query:
             url += "?" + request.url.query
         return url
 
-    def _request_headers(self, request: Request) -> dict[str, str]:
+    def _request_headers(self, request: Request, api_key=_USE_CFG_KEY) -> dict[str, str]:
+        key = self.cfg.api_key if api_key is _USE_CFG_KEY else api_key
         out = {
             k: v for k, v in request.headers.items() if k.lower() not in _REQUEST_DROP
         }
-        if self.cfg.api_key:
+        if key:
             # Proxy-held credential always wins: drop any incoming Authorization
             # (case-insensitively) and inject ours.
             out = {k: v for k, v in out.items() if k.lower() != "authorization"}
-            out["Authorization"] = f"Bearer {self.cfg.api_key}"
+            out["Authorization"] = f"Bearer {key}"
         return out
+
+    def _effective_model(self, body: bytes) -> str | None:
+        """The model in a JSON request body (after any override), else ``None``."""
+        if not body:
+            return None
+        try:
+            data = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            return None
+        if isinstance(data, dict) and isinstance(data.get("model"), str):
+            return data["model"]
+        return None
+
+    def _resolve_route(self, model: str | None) -> tuple[str, str | None]:
+        """Pick the (base_url, api_key) for a request based on its model.
+
+        Matched model -> its route; otherwise the default route; otherwise the
+        global ``upstream_base_url`` / ``api_key``. A route without its own
+        ``api_key`` inherits the global one.
+        """
+        route = None
+        if model is not None and model in self.cfg.model_routes:
+            route = self.cfg.model_routes[model]
+        elif self.cfg.default_route is not None:
+            route = self.cfg.default_route
+        if route is None:
+            return self.cfg.upstream_base_url, self.cfg.api_key
+        api_key = route.api_key if route.api_key is not None else self.cfg.api_key
+        return route.base_url, api_key
 
     def _response_headers(self, resp: httpx.Response) -> dict[str, str]:
         return {

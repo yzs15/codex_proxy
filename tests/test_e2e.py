@@ -343,6 +343,41 @@ async def test_no_model_override_when_unset_forwards_body_verbatim():
     assert r.headers.get("x-codex-proxy-warning") is None
 
 
+async def test_routes_send_each_model_to_its_own_upstream(tmp_path, monkeypatch):
+    # Two upstreams; glm-5.3 -> A, everything else -> default B. Each upstream
+    # must receive its own model's request with its own api_key.
+    seenA, seenB = {}, {}
+
+    def make(seen):
+        async def handler(request):
+            seen["auth"] = request.headers.get("authorization")
+            seen["hit"] = True
+            return StreamingResponse(_sse_success("ok"), media_type="text/event-stream")
+        return Starlette(routes=[Route("/{path:path}", handler, methods=["POST"])])
+
+    async with RunningServer(make(seenA)) as upA, RunningServer(make(seenB)) as upB:
+        routes = {
+            "upstreams": {
+                "A": {"base_url": upA.base, "api_key": "key-A"},
+                "B": {"base_url": upB.base, "api_key": "key-B"},
+            },
+            "default": "B",
+            "models": {"glm-5.3": "A"},
+        }
+        routes_path = tmp_path / "routes.json"
+        routes_path.write_text(__import__("json").dumps(routes))
+        monkeypatch.setenv("CODEX_PROXY_ROUTES_FILE", str(routes_path))
+
+        proxy_app = create_app(fast_cfg("http://unused.invalid"))
+        async with RunningServer(proxy_app) as px:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(f"{px.base}/v1/responses", json={"model": "glm-5.3"})
+                await client.post(f"{px.base}/v1/responses", json={"model": "other-model"})
+
+    assert seenA.get("hit") and seenA["auth"] == "Bearer key-A"  # matched route
+    assert seenB.get("hit") and seenB["auth"] == "Bearer key-B"  # default route
+
+
 async def test_health_endpoint():
     proxy_app = create_app(fast_cfg("http://127.0.0.1:1"))
     async with RunningServer(proxy_app) as px:

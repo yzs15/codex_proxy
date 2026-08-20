@@ -87,6 +87,40 @@ stays clean):
 Note: the Codex CLI does **not** display arbitrary response headers, so the
 header is for logs and tooling — watch the proxy's terminal for the warning.
 
+## Per-model upstream routing
+
+Set `CODEX_PROXY_ROUTES_FILE` to a JSON file to send different models to
+different upstreams (each with its own credential). You name the upstreams once
+(so a shared upstream's key isn't repeated) and map models to them:
+
+```json
+{
+  "upstreams": {
+    "ark":         { "base_url": "https://ark.cn-beijing.volces.com/api/plan/v3", "api_key": "ark-..." },
+    "modelserver": { "base_url": "https://code.ai.cs.ac.cn/v1",                    "api_key": "ms-..." }
+  },
+  "default": "modelserver",
+  "models": {
+    "glm-5.3":           "ark",
+    "deepseek-v4-flash": "ark",
+    "gpt-5.6-sol":       "modelserver"
+  }
+}
+```
+
+Resolution, per request, on the request body's `model` (after any override):
+
+- `model` listed in `models` → that upstream's `base_url` + `api_key`;
+- otherwise the `default` upstream;
+- `default` omitted (or no routes file) → the global `UPSTREAM_BASE_URL` /
+  `API_KEY` — so existing single-upstream setups are unchanged;
+- an upstream may omit `api_key` → it inherits the global `API_KEY`.
+
+The path stays transparent (`upstream.base_url` + the incoming path), so each
+upstream's own prefix lives in its `base_url`. A malformed routes file (bad
+JSON, or a model/`default` naming an unknown upstream) makes the proxy refuse to
+start with a clear message rather than run misconfigured.
+
 ## Configuration
 
 All settings are environment variables prefixed with `CODEX_PROXY_`.
@@ -96,6 +130,7 @@ All settings are environment variables prefixed with `CODEX_PROXY_`.
 | `UPSTREAM_BASE_URL` | `https://api.openai.com` | Where to forward requests. |
 | `API_KEY` | *(unset)* | Upstream credential held by the proxy. When set, the proxy injects `Authorization: Bearer <key>` and **overrides** any Authorization Codex sent. Leave unset to pass Codex's own credential through unchanged. |
 | `MODEL` | *(unset)* | Force a specific model. When set, the proxy rewrites the `model` field of a JSON request body to this value, overriding whatever model Codex requested. On a mismatch it warns **out of band** — see *Model override* below. Leave unset to forward the requested model unchanged. |
+| `ROUTES_FILE` | *(unset)* | Path to a JSON file routing different models to different upstreams (each with its own `base_url` + optional `api_key`), with a `default` for unmatched models. See *Per-model upstream routing* below. Unset → single upstream via `UPSTREAM_BASE_URL`. |
 | `HOST` / `PORT` | `127.0.0.1` / `8787` | Listen address. |
 | `MAX_RETRIES` | *(unset = infinite)* | Cap attempts; after the cap the real error is forwarded. `none`/`0` = retry forever. |
 | `BACKOFF_INITIAL` | `1.0` | First backoff ceiling, seconds. |

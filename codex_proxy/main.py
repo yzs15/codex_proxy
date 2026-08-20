@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import uvicorn
 
 from .app import create_app
@@ -9,8 +11,14 @@ from .config import Config
 
 
 def main() -> None:
-    cfg = Config.from_env()
-    app = create_app(cfg)
+    try:
+        cfg = Config.from_env()
+        app = create_app(cfg)
+    except ValueError as exc:
+        # Bad configuration (e.g. a malformed routes file) — fail fast with a
+        # clear message instead of a traceback, and don't start misconfigured.
+        print(f"codex-proxy: configuration error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
     print(
         f"codex-proxy listening on http://{cfg.host}:{cfg.port} "
         f"-> {cfg.upstream_base_url} "
