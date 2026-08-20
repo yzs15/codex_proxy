@@ -66,6 +66,27 @@ valid one), set `CODEX_PROXY_API_KEY` — the proxy then injects
 
 Health check: `GET /__proxy_health` → `ok`.
 
+## Model override
+
+Set `CODEX_PROXY_MODEL` to force every request onto a specific model. The proxy
+rewrites the `model` field of the (JSON) request body before forwarding — and
+before the retry loop, so the override survives retries. Requests that aren't a
+JSON object with a `model` field (health checks, `GET`s, etc.) pass through
+untouched.
+
+When the model Codex requested differs from the forced one, the proxy raises a
+warning **out of band**, never in the response body (the assistant's answer
+stays clean):
+
+- a log line on the proxy's own terminal / `DEBUG_LOG`, e.g.
+  `⚠️  model override: Codex requested 'gpt-5.6-sol' → proxy forces 'o3'`
+  (logged once per distinct requested→forced pair to avoid spamming);
+- an `X-Codex-Proxy-Warning: requested 'gpt-5.6-sol' but proxy served 'o3'`
+  response header on every affected response, for tooling / inspection.
+
+Note: the Codex CLI does **not** display arbitrary response headers, so the
+header is for logs and tooling — watch the proxy's terminal for the warning.
+
 ## Configuration
 
 All settings are environment variables prefixed with `CODEX_PROXY_`.
@@ -74,6 +95,7 @@ All settings are environment variables prefixed with `CODEX_PROXY_`.
 |---|---|---|
 | `UPSTREAM_BASE_URL` | `https://api.openai.com` | Where to forward requests. |
 | `API_KEY` | *(unset)* | Upstream credential held by the proxy. When set, the proxy injects `Authorization: Bearer <key>` and **overrides** any Authorization Codex sent. Leave unset to pass Codex's own credential through unchanged. |
+| `MODEL` | *(unset)* | Force a specific model. When set, the proxy rewrites the `model` field of a JSON request body to this value, overriding whatever model Codex requested. On a mismatch it warns **out of band** — see *Model override* below. Leave unset to forward the requested model unchanged. |
 | `HOST` / `PORT` | `127.0.0.1` / `8787` | Listen address. |
 | `MAX_RETRIES` | *(unset = infinite)* | Cap attempts; after the cap the real error is forwarded. `none`/`0` = retry forever. |
 | `BACKOFF_INITIAL` | `1.0` | First backoff ceiling, seconds. |

@@ -105,6 +105,13 @@ class Config:
     # credential through unchanged.
     api_key: str | None = field(default_factory=lambda: _env_opt("API_KEY"))
 
+    # Optional model override. When set, the proxy rewrites the ``model`` field of
+    # a JSON request body to this value, forcing the upstream to use it regardless
+    # of what the coding agent requested. A mismatch is surfaced out of band (a
+    # log line + an ``X-Codex-Proxy-Warning`` response header) and never in the
+    # response body. Leave unset to forward the requested model unchanged.
+    model: str | None = field(default_factory=lambda: _env_opt("MODEL"))
+
     # --- retry policy ---
     # ``None`` means retry forever (the default behaviour requested for capacity
     # errors). A positive integer caps attempts, after which the last upstream

@@ -272,6 +272,77 @@ async def test_capacity_in_200_json_body_is_retried():
     assert state["calls"] == 3
 
 
+async def test_model_override_rewrites_upstream_and_warns_via_header():
+    # Proxy forces "o3"; Codex asked for "gpt-5.6-sol". Upstream must receive the
+    # forced model, the mismatch must surface via a response header, and the
+    # response body (the 正文) must stay clean.
+    seen = {}
+
+    async def handler(request):
+        seen["body"] = (await request.body()).decode()
+        return StreamingResponse(_sse_success("hi"), media_type="text/event-stream")
+
+    app = Starlette(routes=[Route("/{path:path}", handler, methods=["POST"])])
+    async with RunningServer(app) as up:
+        proxy_app = create_app(fast_cfg(up.base, model="o3"))
+        async with RunningServer(proxy_app) as px:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(
+                    f"{px.base}/v1/responses", json={"model": "gpt-5.6-sol", "input": "x"}
+                )
+
+    # Upstream saw the forced model, not what Codex requested.
+    assert '"model": "o3"' in seen["body"] or '"model":"o3"' in seen["body"]
+    assert "gpt-5.6-sol" not in seen["body"]
+    # Warning surfaced via the header, naming both models.
+    warn = r.headers.get("x-codex-proxy-warning")
+    assert warn is not None
+    assert "gpt-5.6-sol" in warn and "o3" in warn
+    # The body stays clean — the warning never leaks into the answer.
+    assert "proxy served" not in r.text
+    assert "o3" not in r.text
+    assert r.status_code == 200
+    assert "hi" in r.text
+
+
+async def test_model_override_no_warning_when_model_matches():
+    seen = {}
+
+    async def handler(request):
+        seen["body"] = (await request.body()).decode()
+        return StreamingResponse(_sse_success("hi"), media_type="text/event-stream")
+
+    app = Starlette(routes=[Route("/{path:path}", handler, methods=["POST"])])
+    async with RunningServer(app) as up:
+        proxy_app = create_app(fast_cfg(up.base, model="o3"))
+        async with RunningServer(proxy_app) as px:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(f"{px.base}/v1/responses", json={"model": "o3"})
+
+    assert '"model": "o3"' in seen["body"] or '"model":"o3"' in seen["body"]
+    assert r.headers.get("x-codex-proxy-warning") is None
+
+
+async def test_no_model_override_when_unset_forwards_body_verbatim():
+    seen = {}
+
+    async def handler(request):
+        seen["body"] = (await request.body()).decode()
+        return StreamingResponse(_sse_success("hi"), media_type="text/event-stream")
+
+    app = Starlette(routes=[Route("/{path:path}", handler, methods=["POST"])])
+    async with RunningServer(app) as up:
+        proxy_app = create_app(fast_cfg(up.base, model=None))
+        async with RunningServer(proxy_app) as px:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(
+                    f"{px.base}/v1/responses", json={"model": "gpt-5.6-sol"}
+                )
+
+    assert "gpt-5.6-sol" in seen["body"]  # untouched
+    assert r.headers.get("x-codex-proxy-warning") is None
+
+
 async def test_health_endpoint():
     proxy_app = create_app(fast_cfg("http://127.0.0.1:1"))
     async with RunningServer(proxy_app) as px:

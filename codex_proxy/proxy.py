@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import logging
 
 import httpx
@@ -81,12 +82,25 @@ def _looks_like_sse(data: bytes) -> bool:
     return head.startswith(_SSE_LINE_PREFIXES)
 
 
+def _sanitize_header_value(value: str) -> str:
+    """Reduce a string to printable ASCII, capped in length.
+
+    The requested model name is client-controlled, so it must be scrubbed of
+    CR/LF and other control characters before it goes into a response header —
+    otherwise a crafted model name could split or inject headers.
+    """
+    return "".join(c for c in value if 32 <= ord(c) < 127)[:200]
+
+
 class RetryProxy:
     def __init__(self, cfg: Config, client: httpx.AsyncClient) -> None:
         self.cfg = cfg
         self.client = client
         self.backoff = Backoff.from_config(cfg)
         self._rid = itertools.count(1)
+        # (requested, forced) pairs already warned about, to avoid logging the
+        # same model override on every single request.
+        self._warned_pairs: set[tuple[str, str]] = set()
 
     # ------------------------------------------------------------- diagnostics
 
@@ -106,6 +120,23 @@ class RetryProxy:
         rid = next(self._rid)
         debug = self.cfg.debug
 
+        # Force the configured model (if any) before the retry loop, so the
+        # rewritten body is what gets replayed on every attempt. A mismatch is
+        # reported out of band via _stamp — never in the response body.
+        body, mismatch = self._apply_model_override(body)
+        warning = None
+        if mismatch:
+            requested, forced = mismatch
+            self._log_model_override(requested, forced, rid)
+            warning = _sanitize_header_value(
+                f"requested {requested!r} but proxy served {forced!r}"
+            )
+
+        def _stamp(resp: Response) -> Response:
+            if warning:
+                resp.headers["X-Codex-Proxy-Warning"] = warning
+            return resp
+
         if debug:
             logger.info("[%d] %s %s (request body %dB)", rid, method, url, len(body))
 
@@ -117,7 +148,7 @@ class RetryProxy:
                     logger.info("[%d] client disconnected before attempt %d", rid, attempt)
                 return Response(status_code=499)
             try:
-                return await self._attempt(method, url, headers, body, attempt, rid)
+                return _stamp(await self._attempt(method, url, headers, body, attempt, rid))
             except RetrySignal as sig:
                 if debug:
                     logger.info("[%d] attempt %d -> RETRY (%s)", rid, attempt, sig.reason)
@@ -127,11 +158,11 @@ class RetryProxy:
                 if debug:
                     logger.warning("[%d] attempt %d transport error: %r", rid, attempt, exc)
                 if not self._should_retry(attempt):
-                    return Response(
+                    return _stamp(Response(
                         content=f"upstream request failed: {exc!r}".encode(),
                         status_code=502,
                         media_type="text/plain; charset=utf-8",
-                    )
+                    ))
             try:
                 await self._sleep_backoff(attempt, request, rid)
             except ClientGone:
@@ -366,6 +397,42 @@ class RetryProxy:
         )
 
     # ------------------------------------------------------------------ helpers
+
+    def _apply_model_override(self, body: bytes) -> tuple[bytes, tuple[str, str] | None]:
+        """Force ``cfg.model`` into a JSON request body, reporting any mismatch.
+
+        Returns ``(body, mismatch)`` where ``mismatch`` is ``(requested, forced)``
+        when the request asked for a different model, else ``None``. Only a JSON
+        object carrying a string ``model`` field is ever touched; anything else
+        (no override configured, non-JSON body, missing/non-string ``model``) is
+        returned byte-for-byte unchanged.
+        """
+        forced = self.cfg.model
+        if not forced or not body:
+            return body, None
+        try:
+            data = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            return body, None
+        if not isinstance(data, dict):
+            return body, None
+        requested = data.get("model")
+        if not isinstance(requested, str) or requested == forced:
+            return body, None
+        data["model"] = forced
+        new_body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        return new_body, (requested, forced)
+
+    def _log_model_override(self, requested: str, forced: str, rid: int) -> None:
+        """Warn (once per distinct pair) that a request's model was overridden."""
+        pair = (requested, forced)
+        if pair in self._warned_pairs:
+            logger.debug("[%d] model override (repeat): %r -> %r", rid, requested, forced)
+            return
+        self._warned_pairs.add(pair)
+        logger.warning(
+            "⚠️  model override: Codex requested %r → proxy forces %r", requested, forced
+        )
 
     def _should_retry(self, attempt: int) -> bool:
         return self.cfg.max_retries is None or attempt < self.cfg.max_retries

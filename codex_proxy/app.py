@@ -20,10 +20,16 @@ from .config import Config
 from .proxy import RetryProxy
 
 
-def _configure_debug_logging(cfg: Config) -> None:
-    """Send codex_proxy diagnostic logs to a file (or stderr) at DEBUG level."""
+def _configure_logging(cfg: Config) -> None:
+    """Attach a handler to the codex_proxy logger.
+
+    With ``debug`` on, everything is logged at DEBUG level. With it off we still
+    attach a WARNING-level handler so out-of-band notices (e.g. a model
+    override) reach the proxy's terminal / log file — otherwise they'd be
+    swallowed. Logs go to ``debug_log`` if set, else stderr.
+    """
     log = logging.getLogger("codex_proxy")
-    log.setLevel(logging.DEBUG)
+    log.setLevel(logging.DEBUG if cfg.debug else logging.WARNING)
     log.handlers.clear()
     handler: logging.Handler
     if cfg.debug_log:
@@ -52,8 +58,7 @@ def create_app(
     cfg: Config | None = None, client: httpx.AsyncClient | None = None
 ) -> Starlette:
     cfg = cfg or Config.from_env()
-    if cfg.debug:
-        _configure_debug_logging(cfg)
+    _configure_logging(cfg)
     owns_client = client is None
     client = client or build_client(cfg)
     proxy = RetryProxy(cfg, client)
