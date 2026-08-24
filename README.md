@@ -121,6 +121,52 @@ upstream's own prefix lives in its `base_url`. A malformed routes file (bad
 JSON, or a model/`default` naming an unknown upstream) makes the proxy refuse to
 start with a clear message rather than run misconfigured.
 
+### Stateless upstreams: `strip_reasoning_ids`
+
+Some backends implement the Responses API **statelessly** — they mandate
+`store: false` and never persist items. Such a server returns **404** for any
+`reasoning` item that carries an `id` (it tries to resolve the id against a store
+that was never populated):
+
+> `Item with id 'rs_...' not found. Items are not persisted when 'store' is set
+> to false.`
+
+This bites when you **switch models mid-session**: the coding agent replays the
+earlier turns, and reasoning items minted by the *other* upstream travel along
+with their ids to the stateless one, which doesn't recognise them → 404. (A
+same-model session is fine: the server **does** recognise the reasoning ids it
+just minted itself, so those replay cleanly.)
+
+Set `"strip_reasoning_ids": true` on such an upstream (or globally via
+`CODEX_PROXY_STRIP_REASONING_IDS=1`) to handle it **adaptively**:
+
+1. the request is forwarded **verbatim** (reasoning ids intact);
+2. **only if** the upstream then returns that specific *item-not-found* 404 does
+   the proxy strip `id` from the `reasoning` items and **retry once**.
+
+This is deliberately adaptive rather than unconditional: a same-model turn keeps
+its own reasoning ids (the server accepts them), so nothing is stripped and
+reasoning continuity is untouched; stripping happens only for the foreign ids
+that actually get rejected. Only the id is ever removed — `encrypted_content` and
+every other item are preserved. The cost is one extra round-trip on the turns
+that do carry foreign ids.
+
+```json
+{
+  "upstreams": {
+    "ark":         { "base_url": "https://ark.cn-beijing.volces.com/api/plan/v3", "api_key": "ark-..." },
+    "modelserver": { "base_url": "https://code.ai.cs.ac.cn/v1", "api_key": "ms-...", "strip_reasoning_ids": true }
+  },
+  "default": "modelserver",
+  "models": { "glm-5.3": "ark", "deepseek-v4-flash": "ark" }
+}
+```
+
+**Only enable it for upstreams that need it.** A genuine OpenAI-compatible
+backend that *does* support `store` expects the reasoning `id` on replay;
+stripping it there would degrade or break reasoning continuity. A per-route
+value overrides the global default (route `null`/unset → inherit global).
+
 ## Configuration
 
 All settings are environment variables prefixed with `CODEX_PROXY_`.
@@ -131,6 +177,7 @@ All settings are environment variables prefixed with `CODEX_PROXY_`.
 | `API_KEY` | *(unset)* | Upstream credential held by the proxy. When set, the proxy injects `Authorization: Bearer <key>` and **overrides** any Authorization Codex sent. Leave unset to pass Codex's own credential through unchanged. |
 | `MODEL` | *(unset)* | Force a specific model. When set, the proxy rewrites the `model` field of a JSON request body to this value, overriding whatever model Codex requested. On a mismatch it warns **out of band** — see *Model override* below. Leave unset to forward the requested model unchanged. |
 | `ROUTES_FILE` | *(unset)* | Path to a JSON file routing different models to different upstreams (each with its own `base_url` + optional `api_key`), with a `default` for unmatched models. See *Per-model upstream routing* below. Unset → single upstream via `UPSTREAM_BASE_URL`. |
+| `STRIP_REASONING_IDS` | `false` | Global default for the adaptive reasoning-id fix: on an *item-not-found* 404 from a stateless upstream, strip `id` from `reasoning` items and retry once (same-model turns are forwarded verbatim). A per-upstream `strip_reasoning_ids` in the routes file overrides this. See *Stateless upstreams* above. |
 | `HOST` / `PORT` | `127.0.0.1` / `8787` | Listen address. |
 | `MAX_RETRIES` | *(unset = infinite)* | Cap attempts; after the cap the real error is forwarded. `none`/`0` = retry forever. |
 | `BACKOFF_INITIAL` | `1.0` | First backoff ceiling, seconds. |

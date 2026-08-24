@@ -52,6 +52,30 @@ class ClientGone(Exception):
     """Internal: the downstream client disconnected while we were waiting."""
 
 
+class ReasoningIdRejected(Exception):
+    """Internal: the upstream 404'd because a ``reasoning`` item's ``id`` is
+    unknown to it (a stateless ``store=false`` server can't resolve an id it
+    didn't just mint — e.g. one replayed from another upstream after a model
+    switch). The fix is to strip reasoning ids from the body and retry once.
+    """
+
+
+def _is_reasoning_id_404(status: int, raw: bytes) -> bool:
+    """Does this response mean "a reasoning item's id could not be resolved"?
+
+    Matches the stateless-Responses error, e.g.::
+
+        404 {"error":{"message":"Item with id 'rs_...' not found. Items are not
+        persisted when `store` is set to false. ..."}}
+
+    Deliberately specific so an ordinary 404 (unknown route/model) is not caught.
+    """
+    if status != 404:
+        return False
+    low = raw.decode("utf-8", errors="replace").lower()
+    return "item with id" in low and "not found" in low
+
+
 _HOP_BY_HOP = {
     "connection",
     "keep-alive",
@@ -140,13 +164,20 @@ class RetryProxy:
             return resp
 
         # Route on the (possibly overridden) model: pick the upstream + credential.
-        base_url, api_key = self._resolve_route(self._effective_model(body))
+        base_url, api_key, strip_reasoning_ids = self._resolve_route(
+            self._effective_model(body)
+        )
         url = self._build_url(request, base_url)
         headers = self._request_headers(request, api_key)
 
         if debug:
             logger.info("[%d] %s %s (request body %dB)", rid, method, url, len(body))
 
+        # Reasoning-id stripping is *adaptive*: we forward verbatim (so a same-model
+        # session keeps its own reasoning ids, which the upstream recognises) and
+        # only strip after the upstream actually 404s on an unknown reasoning id —
+        # then retry once with the ids removed. ``stripped`` guards against looping.
+        stripped = False
         attempt = 0
         while True:
             attempt += 1
@@ -155,7 +186,22 @@ class RetryProxy:
                     logger.info("[%d] client disconnected before attempt %d", rid, attempt)
                 return Response(status_code=499)
             try:
-                return _stamp(await self._attempt(method, url, headers, body, attempt, rid))
+                return _stamp(await self._attempt(
+                    method, url, headers, body, attempt, rid,
+                    allow_strip=strip_reasoning_ids and not stripped,
+                ))
+            except ReasoningIdRejected:
+                # Deterministic fix, not a transient failure: strip the offending
+                # ids and retry immediately (no backoff). Body persists for any
+                # later attempts too.
+                body = self._strip_reasoning_ids(body)
+                stripped = True
+                if debug:
+                    logger.info(
+                        "[%d] attempt %d -> reasoning-id 404; stripped ids, retrying",
+                        rid, attempt,
+                    )
+                continue
             except RetrySignal as sig:
                 if debug:
                     logger.info("[%d] attempt %d -> RETRY (%s)", rid, attempt, sig.reason)
@@ -187,6 +233,7 @@ class RetryProxy:
         body: bytes,
         attempt: int,
         rid: int,
+        allow_strip: bool = False,
     ) -> Response:
         debug = self.cfg.debug
         req = self.client.build_request(method, url, headers=headers, content=body)
@@ -205,6 +252,10 @@ class RetryProxy:
             await self._safe_close(resp)
             if debug:
                 logger.info("[%d] attempt %d non-2xx body: %s", rid, attempt, self._snippet(raw))
+            # A stateless upstream rejecting an unknown reasoning id: strip the ids
+            # and retry (handled by the caller) rather than forward the 404.
+            if allow_strip and _is_reasoning_id_404(status, raw):
+                raise ReasoningIdRejected()
             if is_retryable_http(status, raw, self.cfg) and self._should_retry(attempt):
                 raise RetrySignal(f"http {status} matched retryable signature")
             if debug:
@@ -430,6 +481,49 @@ class RetryProxy:
         new_body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         return new_body, (requested, forced)
 
+    def _strip_reasoning_ids(self, body: bytes) -> bytes:
+        """Remove ``id`` from ``reasoning`` items in a JSON request body.
+
+        A stateless Responses upstream (``store=false``, nothing persisted) 404s
+        on a ``reasoning`` item that carries an ``id`` — it tries to resolve the
+        id against a store that was never populated. That happens when the coding
+        agent replays cross-model history (e.g. after switching models), whose
+        reasoning items carry ids minted by a different upstream.
+
+        Only the id is dropped; ``encrypted_content`` (which carries the reasoning
+        itself across turns) and every other item are left as-is. The body is
+        returned byte-for-byte unchanged unless a reasoning id was actually
+        removed, and anything that isn't a JSON object with a list ``input`` is
+        passed through untouched.
+        """
+        if not body:
+            return body
+        try:
+            data = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            return body
+        if not isinstance(data, dict):
+            return body
+        items = data.get("input")
+        if not isinstance(items, list):
+            return body
+        stripped: list[str] = []
+        for item in items:
+            if isinstance(item, dict) and item.get("type") == "reasoning" and "id" in item:
+                rid = item.pop("id")
+                stripped.append(rid if isinstance(rid, str) else str(rid))
+        if not stripped:
+            return body
+        model = data.get("model") if isinstance(data.get("model"), str) else "?"
+        # Fires only when an id was actually removed. In this setup that should
+        # happen on cross-model replay (a switch), not on same-model turns — the
+        # log lets us confirm that empirically.
+        logger.info(
+            "stripped %d reasoning id(s) for model %r before forwarding: %s",
+            len(stripped), model, stripped[:8],
+        )
+        return json.dumps(data, ensure_ascii=False).encode("utf-8")
+
     def _log_model_override(self, requested: str, forced: str, rid: int) -> None:
         """Warn (once per distinct pair) that a request's model was overridden."""
         pair = (requested, forced)
@@ -487,12 +581,13 @@ class RetryProxy:
             return data["model"]
         return None
 
-    def _resolve_route(self, model: str | None) -> tuple[str, str | None]:
-        """Pick the (base_url, api_key) for a request based on its model.
+    def _resolve_route(self, model: str | None) -> tuple[str, str | None, bool]:
+        """Pick the (base_url, api_key, strip_reasoning_ids) for a request.
 
         Matched model -> its route; otherwise the default route; otherwise the
         global ``upstream_base_url`` / ``api_key``. A route without its own
-        ``api_key`` inherits the global one.
+        ``api_key`` inherits the global one; likewise a route whose
+        ``strip_reasoning_ids`` is ``None`` inherits ``cfg.strip_reasoning_ids``.
         """
         route = None
         if model is not None and model in self.cfg.model_routes:
@@ -500,9 +595,14 @@ class RetryProxy:
         elif self.cfg.default_route is not None:
             route = self.cfg.default_route
         if route is None:
-            return self.cfg.upstream_base_url, self.cfg.api_key
+            return self.cfg.upstream_base_url, self.cfg.api_key, self.cfg.strip_reasoning_ids
         api_key = route.api_key if route.api_key is not None else self.cfg.api_key
-        return route.base_url, api_key
+        strip = (
+            route.strip_reasoning_ids
+            if route.strip_reasoning_ids is not None
+            else self.cfg.strip_reasoning_ids
+        )
+        return route.base_url, api_key, strip
 
     def _response_headers(self, resp: httpx.Response) -> dict[str, str]:
         return {

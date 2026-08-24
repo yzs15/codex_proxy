@@ -97,6 +97,12 @@ class Route:
 
     base_url: str
     api_key: str | None = None
+    # Whether to strip ``id`` from ``reasoning`` items in the request body before
+    # forwarding to this upstream. ``None`` means "inherit the global
+    # ``Config.strip_reasoning_ids``"; an explicit bool overrides it. Needed for
+    # stateless Responses upstreams that 404 on a reasoning item carrying an id
+    # (they try to look it up in a store that ``store=false`` never populated).
+    strip_reasoning_ids: bool | None = None
 
 
 def _load_routes(path: str) -> tuple[dict[str, Route], Route | None]:
@@ -129,7 +135,14 @@ def _load_routes(path: str) -> tuple[dict[str, Route], Route | None]:
         api_key = spec.get("api_key")
         if api_key is not None and not isinstance(api_key, str):
             raise ValueError(f"upstream {name!r} 'api_key' must be a string")
-        upstreams[name] = Route(base_url=spec["base_url"], api_key=api_key)
+        strip = spec.get("strip_reasoning_ids")
+        if strip is not None and not isinstance(strip, bool):
+            raise ValueError(
+                f"upstream {name!r} 'strip_reasoning_ids' must be a boolean"
+            )
+        upstreams[name] = Route(
+            base_url=spec["base_url"], api_key=api_key, strip_reasoning_ids=strip
+        )
 
     raw_models = data.get("models") or {}
     if not isinstance(raw_models, dict):
@@ -182,6 +195,15 @@ class Config:
     routes_file: str | None = field(default_factory=lambda: _env_opt("ROUTES_FILE"))
     model_routes: dict[str, Route] = field(default_factory=dict)
     default_route: Route | None = None
+
+    # Strip ``id`` from ``reasoning`` items in the (JSON) request body before
+    # forwarding. Global default for upstreams that don't set their own
+    # ``strip_reasoning_ids``; a per-route value in the routes file overrides it.
+    # Only the id is removed — ``encrypted_content`` is preserved — so same-model
+    # sessions are unaffected. See ``RetryProxy._strip_reasoning_ids``.
+    strip_reasoning_ids: bool = field(
+        default_factory=lambda: _env_bool("STRIP_REASONING_IDS", False)
+    )
 
     # --- retry policy ---
     # ``None`` means retry forever (the default behaviour requested for capacity

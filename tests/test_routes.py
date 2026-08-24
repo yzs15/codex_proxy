@@ -100,12 +100,12 @@ def make_proxy(**cfg_overrides) -> RetryProxy:
 
 def test_resolve_route_matched_model():
     proxy = make_proxy(model_routes={"glm-5.3": Route("https://ark/api", "ark-k")})
-    assert proxy._resolve_route("glm-5.3") == ("https://ark/api", "ark-k")
+    assert proxy._resolve_route("glm-5.3") == ("https://ark/api", "ark-k", False)
 
 
 def test_resolve_route_unmatched_uses_default():
     proxy = make_proxy(model_routes={}, default_route=Route("https://cs/v1", "cs-k"))
-    assert proxy._resolve_route("whatever") == ("https://cs/v1", "cs-k")
+    assert proxy._resolve_route("whatever") == ("https://cs/v1", "cs-k", False)
 
 
 def test_resolve_route_unmatched_no_default_uses_global():
@@ -113,7 +113,7 @@ def test_resolve_route_unmatched_no_default_uses_global():
         upstream_base_url="https://global", api_key="g-k",
         model_routes={}, default_route=None,
     )
-    assert proxy._resolve_route("whatever") == ("https://global", "g-k")
+    assert proxy._resolve_route("whatever") == ("https://global", "g-k", False)
 
 
 def test_resolve_route_missing_api_key_falls_back_to_global():
@@ -121,4 +121,27 @@ def test_resolve_route_missing_api_key_falls_back_to_global():
         api_key="g-k",
         model_routes={"glm-5.3": Route("https://ark/api", None)},
     )
-    assert proxy._resolve_route("glm-5.3") == ("https://ark/api", "g-k")
+    assert proxy._resolve_route("glm-5.3") == ("https://ark/api", "g-k", False)
+
+
+def test_load_routes_reads_strip_reasoning_ids(tmp_path):
+    path = write_routes(tmp_path, {
+        "upstreams": {
+            "cs": {"base_url": "https://cs/v1", "api_key": "cs-k",
+                   "strip_reasoning_ids": True},
+            "ark": {"base_url": "https://ark/api"},
+        },
+        "models": {"gpt-5.6-sol": "cs", "glm-5.3": "ark"},
+    })
+    routes, _ = _load_routes(path)
+    assert routes["gpt-5.6-sol"].strip_reasoning_ids is True
+    assert routes["glm-5.3"].strip_reasoning_ids is None  # unset -> inherit global
+
+
+def test_load_routes_strip_reasoning_ids_must_be_bool(tmp_path):
+    path = write_routes(tmp_path, {
+        "upstreams": {"cs": {"base_url": "https://cs/v1", "strip_reasoning_ids": "yes"}},
+        "models": {"gpt-5.6-sol": "cs"},
+    })
+    with pytest.raises(ValueError, match="strip_reasoning_ids"):
+        _load_routes(path)

@@ -378,6 +378,131 @@ async def test_routes_send_each_model_to_its_own_upstream(tmp_path, monkeypatch)
     assert seenB.get("hit") and seenB["auth"] == "Bearer key-B"  # default route
 
 
+# Reasoning-id stripping is adaptive: forward verbatim, and only strip + retry
+# when the upstream 404s on an unknown reasoning id.
+
+_ITEM_NOT_FOUND = (
+    '{"error":{"message":"Item with id \'rs_foreign\' not found. Items are not '
+    'persisted when `store` is set to false."}}'
+)
+
+
+def _routes_file(tmp_path, monkeypatch, base, strip):
+    routes = {
+        "upstreams": {"cs": {"base_url": base, "api_key": "cs-k",
+                             "strip_reasoning_ids": strip}},
+        "default": "cs", "models": {},
+    }
+    p = tmp_path / "routes.json"
+    p.write_text(__import__("json").dumps(routes))
+    monkeypatch.setenv("CODEX_PROXY_ROUTES_FILE", str(p))
+
+
+_REASONING_PAYLOAD = {
+    "model": "gpt-5.6-sol",
+    "input": [
+        {"type": "reasoning", "id": "rs_foreign", "encrypted_content": "keepme"},
+        {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    ],
+}
+
+
+async def test_reasoning_id_404_triggers_strip_and_retry(tmp_path, monkeypatch):
+    # Stateless upstream: 404 "item not found" while the reasoning id is present,
+    # 200 once it's gone. The proxy must strip the id and retry, hiding the 404.
+    bodies = []
+
+    async def handler(request):
+        b = (await request.body()).decode()
+        bodies.append(b)
+        if "rs_foreign" in b:
+            return Response(_ITEM_NOT_FOUND.encode(), status_code=404,
+                            media_type="application/json")
+        return StreamingResponse(_sse_success("ok"), media_type="text/event-stream")
+
+    app = Starlette(routes=[Route("/{path:path}", handler, methods=["POST"])])
+    async with RunningServer(app) as up:
+        _routes_file(tmp_path, monkeypatch, up.base, strip=True)
+        proxy_app = create_app(fast_cfg("http://unused.invalid"))
+        async with RunningServer(proxy_app) as px:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(f"{px.base}/v1/responses", json=_REASONING_PAYLOAD)
+
+    assert r.status_code == 200
+    assert "ok" in r.text and "not found" not in r.text  # the 404 never leaked
+    assert len(bodies) == 2                    # verbatim attempt, then stripped retry
+    assert "rs_foreign" in bodies[0]           # 1st: forwarded verbatim
+    assert "rs_foreign" not in bodies[1]       # 2nd: id stripped
+    assert "keepme" in bodies[1]               # encrypted_content preserved
+
+
+async def test_same_model_reasoning_id_forwarded_verbatim(tmp_path, monkeypatch):
+    # When the upstream accepts the id (200 straight away — the same-model case),
+    # the body is forwarded verbatim: the reasoning id is NOT stripped and there
+    # is exactly one upstream call.
+    bodies = []
+
+    async def handler(request):
+        bodies.append((await request.body()).decode())
+        return StreamingResponse(_sse_success("ok"), media_type="text/event-stream")
+
+    app = Starlette(routes=[Route("/{path:path}", handler, methods=["POST"])])
+    async with RunningServer(app) as up:
+        _routes_file(tmp_path, monkeypatch, up.base, strip=True)
+        proxy_app = create_app(fast_cfg("http://unused.invalid"))
+        async with RunningServer(proxy_app) as px:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(f"{px.base}/v1/responses", json=_REASONING_PAYLOAD)
+
+    assert r.status_code == 200
+    assert len(bodies) == 1                    # no retry
+    assert "rs_foreign" in bodies[0]           # id preserved — continuity kept
+
+
+async def test_reasoning_id_404_forwarded_when_strip_off(tmp_path, monkeypatch):
+    # Same 404, but the upstream isn't flagged: forward it verbatim, don't retry.
+    bodies = []
+
+    async def handler(request):
+        bodies.append((await request.body()).decode())
+        return Response(_ITEM_NOT_FOUND.encode(), status_code=404,
+                        media_type="application/json")
+
+    app = Starlette(routes=[Route("/{path:path}", handler, methods=["POST"])])
+    async with RunningServer(app) as up:
+        _routes_file(tmp_path, monkeypatch, up.base, strip=False)
+        proxy_app = create_app(fast_cfg("http://unused.invalid"))
+        async with RunningServer(proxy_app) as px:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(f"{px.base}/v1/responses", json=_REASONING_PAYLOAD)
+
+    assert r.status_code == 404
+    assert len(bodies) == 1                    # forwarded, not retried
+
+
+async def test_unrelated_404_is_not_stripped(tmp_path, monkeypatch):
+    # A different 404 (e.g. unknown route) must NOT trigger strip-and-retry even
+    # with the flag on — it's forwarded as-is.
+    bodies = []
+
+    async def handler(request):
+        bodies.append((await request.body()).decode())
+        return Response(b'{"error":{"message":"route not found"}}', status_code=404,
+                        media_type="application/json")
+
+    app = Starlette(routes=[Route("/{path:path}", handler, methods=["POST"])])
+    async with RunningServer(app) as up:
+        _routes_file(tmp_path, monkeypatch, up.base, strip=True)
+        proxy_app = create_app(fast_cfg("http://unused.invalid"))
+        async with RunningServer(proxy_app) as px:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(f"{px.base}/v1/responses", json=_REASONING_PAYLOAD)
+
+    assert r.status_code == 404
+    assert len(bodies) == 1
+    assert "rs_foreign" in bodies[0]           # untouched
+
+
 async def test_health_endpoint():
     proxy_app = create_app(fast_cfg("http://127.0.0.1:1"))
     async with RunningServer(proxy_app) as px:
