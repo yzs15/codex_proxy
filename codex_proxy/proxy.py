@@ -30,9 +30,10 @@ from .detector import (
     EventClass,
     classify_sse_event,
     contains_retry_signal,
+    is_capacity_sse_event,
     is_retryable_http,
 )
-from .sse import SSEDecoder
+from .sse import SSEDecoder, parse_event
 
 logger = logging.getLogger("codex_proxy")
 
@@ -288,6 +289,10 @@ class RetryProxy:
                 rid, attempt, is_sse, content_type, initial[:32],
             )
         if is_sse:
+            if self.cfg.buffer_full_sse:
+                return await self._buffer_full_stream(
+                    resp, attempt, resp_headers, content_type, rid, aiter, initial
+                )
             return await self._gate_stream(
                 resp, attempt, resp_headers, content_type, rid, aiter, initial
             )
@@ -321,6 +326,67 @@ class RetryProxy:
         return Response(
             content=raw,
             status_code=status,
+            headers=resp_headers,
+            media_type=content_type or None,
+        )
+
+    async def _buffer_full_stream(
+        self,
+        resp: httpx.Response,
+        attempt: int,
+        resp_headers: dict[str, str],
+        content_type: str,
+        rid: int,
+        aiter,
+        initial: bytes,
+    ) -> Response:
+        """Buffer an entire SSE response before exposing it downstream.
+
+        This opt-in mode is intentionally separate from the normal commit gate:
+        even output/text events are held until EOF, so a late capacity event can
+        still discard the whole attempt and retry without having sent a partial
+        response to Codex. It is useful for diagnosing gateways that report
+        overload after generation starts, but it removes live streaming and can
+        consume substantial memory for large responses.
+        """
+        debug = self.cfg.debug
+        chunks = bytearray(initial)
+        try:
+            async for chunk in aiter:
+                chunks.extend(chunk)
+        except httpx.RequestError as exc:
+            await self._safe_close(resp)
+            if self._should_retry(attempt):
+                raise RetrySignal(f"full-buffer stream transport error: {exc!r}")
+            raise
+        await self._safe_close(resp)
+        raw = bytes(chunks)
+
+        decoder = SSEDecoder()
+        events = decoder.feed(raw)
+        if decoder.leftover:
+            events.append(parse_event(decoder.leftover))
+        capacity = next(
+            (event for event in events if is_capacity_sse_event(event, self.cfg)),
+            None,
+        )
+        if capacity is not None and self._should_retry(attempt):
+            if debug:
+                logger.info(
+                    "[%d] attempt %d full-buffer SSE matched capacity signal -> retry: %s",
+                    rid, attempt, self._snippet(capacity.raw or capacity.data),
+                )
+            raise RetrySignal(
+                f"full-buffer SSE event type={capacity.event!r} matched capacity signal"
+            )
+        if debug:
+            logger.info(
+                "[%d] attempt %d full-buffer SSE (%dB) forwarded",
+                rid, attempt, len(raw),
+            )
+        return Response(
+            content=raw,
+            status_code=resp.status_code,
             headers=resp_headers,
             media_type=content_type or None,
         )
@@ -404,13 +470,32 @@ class RetryProxy:
             raise
 
         if not committed:
+            # A few gateways close immediately after writing the last SSE event
+            # and omit its final blank-line terminator. Treat that trailing
+            # bytestring as an event for retry detection, while preserving it
+            # verbatim if it is not a capacity failure.
+            if decoder.leftover:
+                trailing = parse_event(decoder.leftover)
+                if (
+                    is_capacity_sse_event(trailing, self.cfg)
+                    and self._should_retry(attempt)
+                ):
+                    await self._safe_close(resp)
+                    raise RetrySignal(
+                        f"unterminated sse event type={trailing.event!r} matched capacity signal"
+                    )
             # Clean EOF with only lifecycle/heartbeat events. Nothing marks it
             # retryable, so forward verbatim rather than loop forever.
             final = bytes(to_flush) + decoder.leftover
             await self._safe_close(resp)
             if debug:
-                leaked = contains_retry_signal(
-                    final.decode("utf-8", errors="replace"), self.cfg
+                final_decoder = SSEDecoder()
+                final_events = final_decoder.feed(final)
+                if final_decoder.leftover:
+                    final_events.append(parse_event(final_decoder.leftover))
+                leaked = any(
+                    is_capacity_sse_event(event, self.cfg)
+                    for event in final_events
                 )
                 logger.log(
                     logging.WARNING if leaked else logging.INFO,
@@ -428,21 +513,39 @@ class RetryProxy:
 
         async def body_gen():
             leak_logged = False
+            leak_decoder = SSEDecoder()
+
+            def inspect_post_commit(chunk: bytes) -> None:
+                """Log a structured capacity event that arrives too late.
+
+                Do not search arbitrary response bytes here: a normal assistant
+                answer may quote the capacity phrase, which used to produce a
+                misleading ``LEAKED`` warning. The stream has already committed,
+                so this is diagnostics only; retrying at this point would corrupt
+                the downstream response.
+                """
+                nonlocal leak_logged
+                if not debug or leak_logged:
+                    return
+                for event in leak_decoder.feed(chunk):
+                    if is_capacity_sse_event(event, self.cfg):
+                        logger.warning(
+                            "[%d] CAPACITY SIGNAL in POST-COMMIT stream — LEAKED to client "
+                            "(arrived after content started; cannot retry safely): %s",
+                            rid, self._snippet(event.raw),
+                        )
+                        leak_logged = True
+                        break
+
             try:
                 if to_flush:
                     yield bytes(to_flush)
                 if remainder:
-                    yield bytes(remainder)
+                    chunk = bytes(remainder)
+                    inspect_post_commit(chunk)
+                    yield chunk
                 async for chunk in aiter:
-                    if debug and not leak_logged and contains_retry_signal(
-                        chunk.decode("utf-8", errors="replace"), self.cfg
-                    ):
-                        logger.warning(
-                            "[%d] CAPACITY SIGNAL in POST-COMMIT stream — LEAKED to client "
-                            "(arrived after content started; cannot retry safely): %s",
-                            rid, self._snippet(chunk),
-                        )
-                        leak_logged = True
+                    inspect_post_commit(chunk)
                     yield chunk
             finally:
                 await self._safe_close(resp)

@@ -22,6 +22,15 @@ if [ -f "$HOME/.bashrc" ]; then
     set -e
 fi
 
+# An installation created by install.sh keeps its generated exports here. Load
+# this after ~/.bashrc so the installation's route file and proxy endpoint win
+# over stale values from an older shell configuration. The file is optional,
+# so the repository launcher remains usable without running the installer.
+if [ -f "$SCRIPT_DIR/env.sh" ]; then
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/env.sh"
+fi
+
 # 2. Activate the project virtualenv.
 if [ -f "$SCRIPT_DIR/.venv/bin/activate" ]; then
     # shellcheck disable=SC1091

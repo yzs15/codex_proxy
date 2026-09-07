@@ -244,6 +244,87 @@ async def test_capacity_hidden_when_sse_served_as_text_plain():
     assert state["calls"] == 3  # 2 capacity failures + 1 success
 
 
+async def test_capacity_after_reasoning_item_is_retried_before_commit():
+    # The real gateway can announce a reasoning item before reporting capacity
+    # in response.output_text.done. The reasoning announcement must stay in the
+    # prelude; otherwise the failure is committed and leaks to Codex.
+    state = {"calls": 0}
+
+    async def failing_stream():
+        yield b'event: response.created\ndata: {"id":"resp_x"}\n\n'
+        yield b'event: response.in_progress\ndata: {}\n\n'
+        yield (
+            b'event: response.output_item.added\ndata: '
+            b'{"type":"response.output_item.added","item":{"type":"reasoning",'
+            b'"id":"rs_x"}}\n\n'
+        )
+        yield (
+            b'event: response.output_item.done\ndata: '
+            b'{"type":"response.output_item.done","item":{"type":"reasoning",'
+            b'"id":"rs_x"}}\n\n'
+        )
+        yield b'event: keepalive\ndata: {"type":"keepalive"}\n\n'
+        yield (
+            b'event: response.output_text.done\ndata: '
+            b'{"type":"response.output_text.done","text":"\xe2\x9a\xa0 '
+            + CAPACITY.encode()
+            + b'"}\n\n'
+        )
+
+    async def handler(request):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return StreamingResponse(failing_stream(), media_type="text/plain")
+        return StreamingResponse(_sse_success("recovered"), media_type="text/plain")
+
+    app = Starlette(routes=[Route("/{path:path}", handler, methods=["POST"])])
+    async with RunningServer(app) as up:
+        proxy_app = create_app(fast_cfg(up.base))
+        async with RunningServer(proxy_app) as px:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(f"{px.base}/v1/responses", json={})
+
+    assert r.status_code == 200
+    assert "recovered" in r.text
+    assert "capacity" not in r.text.lower()
+    assert state["calls"] == 2
+
+
+async def test_full_buffer_retries_capacity_after_content_started():
+    # Experimental full-buffer mode can recover even when the gateway emits a
+    # partial text delta before its overload event. No partial bytes reach the
+    # client because the first attempt is held until EOF.
+    state = {"calls": 0}
+
+    async def failing_stream():
+        yield b'event: response.created\ndata: {"id":"resp_x"}\n\n'
+        yield b'event: response.in_progress\ndata: {}\n\n'
+        yield b'event: response.output_text.delta\ndata: {"delta":"partial"}\n\n'
+        yield (
+            b'event: error\ndata: {"type":"error","error":{"code":"server_is_overloaded",'
+            b'"message":"Our servers are currently overloaded. Please try again later."}}\n\n'
+        )
+
+    async def handler(request):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return StreamingResponse(failing_stream(), media_type="text/plain")
+        return StreamingResponse(_sse_success("recovered"), media_type="text/plain")
+
+    app = Starlette(routes=[Route("/{path:path}", handler, methods=["POST"])])
+    async with RunningServer(app) as up:
+        proxy_app = create_app(fast_cfg(up.base, buffer_full_sse=True))
+        async with RunningServer(proxy_app) as px:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(f"{px.base}/v1/responses", json={})
+
+    assert r.status_code == 200
+    assert "recovered" in r.text
+    assert "partial" not in r.text
+    assert "overloaded" not in r.text.lower()
+    assert state["calls"] == 2
+
+
 async def test_capacity_in_200_json_body_is_retried():
     # Some gateways answer 200 with an error JSON body (not SSE). It must be
     # inspected and retried, not forwarded as success.

@@ -52,10 +52,48 @@ def test_sse_lifecycle_keeps_gate_open():
 
 def test_sse_heartbeat_is_lifecycle():
     assert classify_sse_event(_ev(None, ""), CFG) is EventClass.LIFECYCLE
+    assert classify_sse_event(_ev("keepalive", "{}"), CFG) is EventClass.LIFECYCLE
+    assert classify_sse_event(_ev("ping", '{"timestamp":1}'), CFG) is EventClass.LIFECYCLE
 
 
 def test_sse_content_commits():
     ev = _ev("response.output_text.delta", '{"delta":"Hello"}')
+    assert classify_sse_event(ev, CFG) is EventClass.COMMIT
+
+
+def test_sse_output_item_announcement_keeps_gate_open():
+    # A reasoning output item is announced before generated text begins. It is
+    # prelude, not downstream-visible content: a later capacity failure must
+    # still be allowed to trigger a retry.
+    ev = _ev(
+        "response.output_item.added",
+        '{"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_1"}}',
+    )
+    assert classify_sse_event(ev, CFG) is EventClass.LIFECYCLE
+    assert classify_sse_event(
+        _ev("response.output_item.done", '{"type":"response.output_item.done"}'), CFG
+    ) is EventClass.LIFECYCLE
+    assert classify_sse_event(
+        _ev(None, '{"type":"response.output_item.added","item":{"type":"reasoning"}}'), CFG
+    ) is EventClass.LIFECYCLE
+
+
+def test_sse_output_text_done_warning_is_retryable():
+    ev = _ev(
+        "response.output_text.done",
+        '{"type":"response.output_text.done",'
+        '"text":"⚠ Selected model is at capacity. Please try a different model."}',
+    )
+    assert classify_sse_event(ev, CFG) is EventClass.RETRY
+
+
+def test_sse_normal_text_mention_is_not_retryable():
+    # The capacity phrase in ordinary generated content must not be mistaken
+    # for an upstream failure, especially after the stream has committed.
+    ev = _ev(
+        "response.output_text.delta",
+        '{"delta":"Explain what Selected model is at capacity means."}',
+    )
     assert classify_sse_event(ev, CFG) is EventClass.COMMIT
 
 

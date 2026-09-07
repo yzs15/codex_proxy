@@ -239,6 +239,12 @@ class Config:
     max_prelude_bytes: int = field(
         default_factory=lambda: int(_env("MAX_PRELUDE_BYTES", "65536"))
     )
+    # Experimental mode: buffer the complete SSE response before sending any
+    # bytes downstream. This catches capacity failures that arrive after model
+    # output has started, at the cost of streaming latency and memory usage.
+    buffer_full_sse: bool = field(
+        default_factory=lambda: _env_bool("BUFFER_FULL_SSE", False)
+    )
 
     # --- diagnostics ---
     # When on, logs every upstream attempt's status/body/SSE events, each retry
