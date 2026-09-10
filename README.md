@@ -59,6 +59,19 @@ CODEX_PROXY_DEBUG_LOG=/tmp/codex-proxy-debug.log \
 
 代理默认监听 `http://127.0.0.1:8787`。将 Codex 的 provider 地址指向该地址即可。
 
+该代理使用 HTTP POST/SSE，不代理 Responses API WebSocket 传输。
+在 `~/.codex/config.toml` 中为此 provider 显式关闭 WebSocket，避免 Codex
+发起升级请求后再回退到 HTTP：
+
+```toml
+[model_providers.proxy]
+name = "proxy"
+base_url = "http://127.0.0.1:8787"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+supports_websockets = false
+```
+
 `CODEX_PROXY_BUFFER_FULL_SSE=1` 会等待整条 SSE 接收完成后再转发，可捕获生成后才出现的容量错误，但会失去实时输出并增加内存占用；不需要时可设为 `0`。
 
 健康检查：
